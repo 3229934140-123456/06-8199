@@ -12,7 +12,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from binary_parser import (
-    BinaryParser, FieldInfo,
+    BinaryParser, FieldInfo, DiffEntry,
     UInt8, UInt16, UInt32, UInt64,
     Int8, Int16, Int32, Int64,
     Float32, Float64,
@@ -22,6 +22,8 @@ from binary_parser import (
     Endian, ParseError, InsufficientDataError, ValidationError,
     build_parser_from_schema, build_parser_from_file,
     eval_expression,
+    compare_results, filter_field_info,
+    export_field_info_json, export_field_info_csv,
 )
 
 
@@ -963,6 +965,271 @@ class TestSchemaExpressionFormats(unittest.TestCase):
         parser = build_parser_from_schema(schema)
         result = parser.parse(b"\x01\x34\x12")
         self.assertEqual(result["extra"], 0x1234)
+
+
+class TestNestedInspect(unittest.TestCase):
+    """测试 inspect 深入嵌套 struct / array / conditional 内部字段。"""
+
+    def test_array_element_fields_recorded(self):
+        parser = BinaryParser([
+            UInt8("count"),
+            Array("items", element=UInt32("id"), count="count"),
+        ], endian=Endian.LITTLE)
+        data = struct.pack("<BIII", 3, 100, 200, 300)
+        result = parser.parse(data, inspect=True)
+        paths = [".".join(fi.path) for fi in result.field_info]
+        self.assertIn("count", paths)
+        self.assertIn("items.0.id", paths)
+        self.assertIn("items.1.id", paths)
+        self.assertIn("items.2.id", paths)
+        self.assertIn("items", paths)
+
+    def test_struct_inner_fields_recorded(self):
+        parser = BinaryParser([
+            UInt8("header"),
+            Struct("point", fields=[
+                Int32("x"), Int32("y"), Int32("z"),
+            ]),
+        ], endian=Endian.LITTLE)
+        data = struct.pack("<Biii", 1, 10, -20, 30)
+        result = parser.parse(data, inspect=True)
+        paths = [".".join(fi.path) for fi in result.field_info]
+        self.assertIn("header", paths)
+        self.assertIn("point.x", paths)
+        self.assertIn("point.y", paths)
+        self.assertIn("point.z", paths)
+        self.assertIn("point", paths)
+        # 检查具体偏移
+        by_path = {".".join(fi.path): fi for fi in result.field_info}
+        self.assertEqual(by_path["header"].start_offset, 0)
+        self.assertEqual(by_path["header"].end_offset, 1)
+        self.assertEqual(by_path["point.x"].start_offset, 1)
+        self.assertEqual(by_path["point.x"].end_offset, 5)
+        self.assertEqual(by_path["point.y"].start_offset, 5)
+        self.assertEqual(by_path["point.y"].end_offset, 9)
+        self.assertEqual(by_path["point.z"].start_offset, 9)
+        self.assertEqual(by_path["point.z"].end_offset, 13)
+
+    def test_array_of_structs_nested_paths(self):
+        parser = BinaryParser([
+            UInt8("n"),
+            Array("points", count="n", element=Struct(fields=[
+                UInt16("x"), UInt16("y"),
+            ])),
+        ], endian=Endian.LITTLE)
+        data = struct.pack("<BHHHH", 2, 1, 2, 3, 4)
+        result = parser.parse(data, inspect=True)
+        paths = [".".join(fi.path) for fi in result.field_info]
+        self.assertIn("points.0.x", paths)
+        self.assertIn("points.0.y", paths)
+        self.assertIn("points.1.x", paths)
+        self.assertIn("points.1.y", paths)
+        by_path = {".".join(fi.path): fi for fi in result.field_info}
+        self.assertEqual(by_path["points.0.x"].value, 1)
+        self.assertEqual(by_path["points.0.y"].value, 2)
+        self.assertEqual(by_path["points.1.x"].value, 3)
+        self.assertEqual(by_path["points.1.y"].value, 4)
+
+    def test_conditional_inner_field_recorded(self):
+        parser = BinaryParser([
+            UInt8("flags"),
+            Conditional("opt", condition=lambda c: c["flags"] & 1,
+                        field=UInt32("opt")),
+        ], endian=Endian.LITTLE)
+        data = struct.pack("<BI", 1, 0xDEAD)
+        result = parser.parse(data, inspect=True)
+        paths = [".".join(fi.path) for fi in result.field_info]
+        self.assertIn("flags", paths)
+        self.assertIn("opt.opt", paths)   # conditional 内字段名
+        self.assertIn("opt", paths)        # conditional 整体
+
+    def test_conditional_absent_no_children(self):
+        parser = BinaryParser([
+            UInt8("flags"),
+            Conditional("opt", condition=lambda c: c["flags"] & 1,
+                        field=UInt32("opt")),
+        ], endian=Endian.LITTLE)
+        data = struct.pack("<B", 0)
+        result = parser.parse(data, inspect=True)
+        paths = [".".join(fi.path) for fi in result.field_info]
+        self.assertIn("flags", paths)
+        self.assertIn("opt", paths)       # conditional 本体仍记录
+        self.assertNotIn("opt.opt", paths)  # 条件不满足，没有内部字段
+
+    def test_string_with_length_prefix_records_both(self):
+        parser = BinaryParser([
+            String("name", length=UInt16("name_len"), encoding="ascii"),
+        ], endian=Endian.LITTLE)
+        name_bytes = b"hello"
+        data = struct.pack("<H", len(name_bytes)) + name_bytes
+        result = parser.parse(data, inspect=True)
+        paths = [".".join(fi.path) for fi in result.field_info]
+        self.assertIn("name_len", paths)
+        self.assertIn("name", paths)
+        by_path = {".".join(fi.path): fi for fi in result.field_info}
+        self.assertEqual(by_path["name_len"].value, 5)
+        self.assertEqual(by_path["name"].value, "hello")
+        self.assertEqual(by_path["name_len"].start_offset, 0)
+        self.assertEqual(by_path["name_len"].end_offset, 2)
+        self.assertEqual(by_path["name"].start_offset, 2)
+        self.assertEqual(by_path["name"].end_offset, 7)
+
+
+class TestCompare(unittest.TestCase):
+    """测试 compare_results 对比两份解析结果。"""
+
+    def _build_parser(self):
+        return BinaryParser([
+            UInt8("a"), UInt16("b"), UInt32("c"),
+            Array("xs", count=2, element=UInt8("x")),
+        ], endian=Endian.LITTLE)
+
+    def test_identical_no_diff(self):
+        parser = self._build_parser()
+        d1 = struct.pack("<BHIBB", 1, 2, 3, 4, 5)
+        d2 = bytes(d1)
+        r1 = parser.parse(d1, inspect=True)
+        r2 = parser.parse(d2, inspect=True)
+        diffs = compare_results(r1, r2)
+        self.assertEqual(len(diffs), 0)
+
+    def test_simple_value_diff(self):
+        parser = self._build_parser()
+        d1 = struct.pack("<BHIBB", 1, 2, 3, 4, 5)
+        d2 = struct.pack("<BHIBB", 1, 99, 3, 4, 5)
+        r1 = parser.parse(d1, inspect=True)
+        r2 = parser.parse(d2, inspect=True)
+        diffs = compare_results(r1, r2)
+        paths = [d.path for d in diffs]
+        self.assertIn("b", paths)
+        d_by_path = {d.path: d for d in diffs}
+        self.assertEqual(d_by_path["b"].old_value, 2)
+        self.assertEqual(d_by_path["b"].new_value, 99)
+        self.assertEqual(d_by_path["b"].diff_type, "value")
+
+    def test_array_element_diff(self):
+        parser = BinaryParser([
+            UInt8("count"),
+            Array("items", count="count", element=UInt16("val")),
+        ], endian=Endian.LITTLE)
+        d1 = struct.pack("<BHH", 2, 10, 20)
+        d2 = struct.pack("<BHH", 2, 10, 999)
+        r1 = parser.parse(d1, inspect=True)
+        r2 = parser.parse(d2, inspect=True)
+        diffs = compare_results(r1, r2)
+        paths = [d.path for d in diffs]
+        self.assertIn("items.1.val", paths)
+        d_by_path = {d.path: d for d in diffs}
+        self.assertEqual(d_by_path["items.1.val"].old_value, 20)
+        self.assertEqual(d_by_path["items.1.val"].new_value, 999)
+
+    def test_diffentry_to_dict(self):
+        entry = DiffEntry(
+            path="header.x",
+            old_value=1, new_value=2,
+            old_start=0, new_start=0,
+            old_size=4, new_size=4,
+            old_hex="01000000", new_hex="02000000",
+            diff_type="value",
+        )
+        d = entry.to_dict()
+        self.assertEqual(d["path"], "header.x")
+        self.assertEqual(d["diff_type"], "value")
+        self.assertEqual(d["old"]["value"], 1)
+        self.assertEqual(d["new"]["value"], 2)
+        self.assertEqual(d["old"]["hex"], "01000000")
+
+
+class TestExportAndFilter(unittest.TestCase):
+    """测试 filter_field_info / export_json / export_csv。"""
+
+    def _sample_result(self):
+        parser = BinaryParser([
+            UInt8("n"),
+            Struct("pt", fields=[UInt16("x"), UInt16("y")]),
+            Array("arr", count=2, element=UInt8("v")),
+        ], endian=Endian.LITTLE)
+        data = struct.pack("<BHHBB", 1, 10, 20, 7, 8)
+        return parser.parse(data, inspect=True)
+
+    def test_filter_by_top_level_prefix(self):
+        r = self._sample_result()
+        filtered = filter_field_info(r.field_info, "pt")
+        paths = sorted([".".join(fi.path) for fi in filtered])
+        self.assertEqual(paths, ["pt", "pt.x", "pt.y"])
+
+    def test_filter_by_nested_prefix(self):
+        r = self._sample_result()
+        filtered = filter_field_info(r.field_info, "arr")
+        paths = sorted([".".join(fi.path) for fi in filtered])
+        self.assertEqual(paths, ["arr", "arr.0.v", "arr.1.v"])
+
+    def test_filter_empty_prefix_returns_all(self):
+        r = self._sample_result()
+        filtered = filter_field_info(r.field_info, None)
+        self.assertEqual(len(filtered), len(r.field_info))
+        filtered2 = filter_field_info(r.field_info, "")
+        self.assertEqual(len(filtered2), len(r.field_info))
+
+    def test_export_json_string(self):
+        r = self._sample_result()
+        text = export_field_info_json(r.field_info)
+        parsed = eval(text)  # 用 json 解析
+        import json
+        parsed = json.loads(text)
+        self.assertIsInstance(parsed, list)
+        paths = [p["path"] for p in parsed]
+        self.assertIn("pt.x", paths)
+        self.assertIn("pt.y", paths)
+        self.assertIn("arr", paths)
+        # 每条记录都要有这些字段
+        for p in parsed:
+            for key in ["path", "name", "start_offset", "end_offset", "size", "hex", "value"]:
+                self.assertIn(key, p)
+
+    def test_export_csv_string(self):
+        r = self._sample_result()
+        text = export_field_info_csv(r.field_info)
+        lines = text.strip().split("\n")
+        header = lines[0]
+        self.assertIn("path", header)
+        self.assertIn("hex", header)
+        self.assertIn("value", header)
+        # 除表头外应有记录
+        self.assertGreater(len(lines), 1)
+        # 某条包含已知路径
+        path_col_idx = header.split(",").index("path")
+        data_paths = [ln.split(",")[path_col_idx] for ln in lines[1:]]
+        self.assertIn("pt.x", data_paths)
+
+    def test_export_json_file(self):
+        import tempfile
+        r = self._sample_result()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="w") as f:
+            tmp = f.name
+        try:
+            export_field_info_json(r.field_info, tmp)
+            import json
+            with open(tmp, "r", encoding="utf-8") as f:
+                parsed = json.load(f)
+            self.assertIsInstance(parsed, list)
+            self.assertGreater(len(parsed), 0)
+        finally:
+            os.unlink(tmp)
+
+    def test_export_csv_file(self):
+        import tempfile
+        r = self._sample_result()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w") as f:
+            tmp = f.name
+        try:
+            export_field_info_csv(r.field_info, tmp)
+            with open(tmp, "r", encoding="utf-8") as f:
+                text = f.read()
+            self.assertIn("path,name,start_offset", text)
+            self.assertIn("pt.x", text)
+        finally:
+            os.unlink(tmp)
 
 
 if __name__ == "__main__":

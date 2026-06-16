@@ -7,6 +7,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from binary_parser import (
     build_parser_from_file, ParseError, InsufficientDataError, ValidationError,
+    filter_field_info, export_field_info_json, export_field_info_csv,
+    compare_results,
 )
 
 
@@ -56,14 +58,14 @@ def format_error(e, data):
     return "\n".join(parts)
 
 
-def format_inspect_table(result):
+def format_inspect_table(field_info_list, total_consumed=None):
     rows = []
     max_path_len = 4
     max_offset_len = 8
     max_size_len = 4
     max_hex_len = 8
 
-    for info in result.field_info:
+    for info in field_info_list:
         path_str = ".".join(info.path)
         offset_str = f"0x{info.start_offset:04x}"
         end_str = f"0x{info.end_offset:04x}"
@@ -110,8 +112,58 @@ def format_inspect_table(result):
             f"{val_repr}"
         )
     lines.append(sep)
-    lines.append(f"Total fields: {len(result.field_info)}  Consumed: {result.consumed} bytes")
+    footer = f"Total fields: {len(field_info_list)}"
+    if total_consumed is not None:
+        footer += f"  Consumed: {total_consumed} bytes"
+    lines.append(footer)
     return "\n".join(lines)
+
+
+def format_compare_table(diffs):
+    rows = []
+    max_path_len = 4
+    max_type_len = 4
+
+    for d in diffs:
+        type_str = d.diff_type
+        path_str = d.path
+        old_short = _short_value(d.old_value, d.old_hex)
+        new_short = _short_value(d.new_value, d.new_hex)
+        rows.append((path_str, type_str, old_short, new_short))
+        max_path_len = max(max_path_len, len(path_str))
+        max_type_len = max(max_type_len, len(type_str))
+
+    header = (
+        f"{'Path':<{max_path_len}}  "
+        f"{'Type':<{max_type_len}}  "
+        f"{'Old':<32s}  "
+        f"{'New':<32s}"
+    )
+    sep = "-" * len(header)
+    lines = [sep, header, sep]
+    for path_str, type_str, old_s, new_s in rows:
+        lines.append(
+            f"{path_str:<{max_path_len}}  "
+            f"{type_str:<{max_type_len}}  "
+            f"{old_s:<32s}  "
+            f"{new_s:<32s}"
+        )
+    lines.append(sep)
+    lines.append(f"Total differences: {len(diffs)}")
+    return "\n".join(lines)
+
+
+def _short_value(value, hex_str):
+    if value is None:
+        return "(absent)"
+    if isinstance(value, (list, dict)):
+        return f"<{type(value).__name__} len={len(value)}>"
+    v = repr(value)
+    if len(v) > 28:
+        v = v[:25] + "..."
+    if hex_str and len(hex_str) <= 10:
+        return f"{v} [{hex_str}]"
+    return v
 
 
 def _json_default(obj):
@@ -125,7 +177,7 @@ def _json_default(obj):
 def main():
     argparser = argparse.ArgumentParser(
         prog="binparse",
-        description="Binary structure parser - parse binary files using declarative format definitions",
+        description="Binary structure parser - parse/inspect/compare binary files using declarative format definitions",
     )
     argparser.add_argument(
         "schema",
@@ -133,7 +185,12 @@ def main():
     )
     argparser.add_argument(
         "binary",
-        help="Path to binary file to parse",
+        help="Path to binary file to parse (primary input)",
+    )
+    argparser.add_argument(
+        "--compare",
+        metavar="BINARY2",
+        help="Compare mode: parse a second binary file and show field-by-field diffs",
     )
     argparser.add_argument(
         "-o", "--offset",
@@ -162,8 +219,25 @@ def main():
         action="store_true",
         help="Inspect mode: also print a table with each field's offset, hex and value",
     )
+    argparser.add_argument(
+        "--filter",
+        metavar="PATH_PREFIX",
+        help="Only show fields whose path starts with this prefix (e.g. 'file_entries' or 'header.version')",
+    )
+    argparser.add_argument(
+        "--export-json",
+        metavar="OUTPUT.json",
+        help="Export inspect results to a JSON file",
+    )
+    argparser.add_argument(
+        "--export-csv",
+        metavar="OUTPUT.csv",
+        help="Export inspect results to a CSV file",
+    )
 
     args = argparser.parse_args()
+
+    need_inspect = any([args.inspect, args.filter, args.export_json, args.export_csv, args.compare])
 
     try:
         parser = build_parser_from_file(args.schema)
@@ -178,8 +252,17 @@ def main():
         print(f"\033[91mERROR\033[0m: Failed to read binary file: {e}", file=sys.stderr)
         sys.exit(1)
 
+    data2 = None
+    if args.compare:
+        try:
+            with open(args.compare, "rb") as f:
+                data2 = f.read()
+        except Exception as e:
+            print(f"\033[91mERROR\033[0m: Failed to read compare file: {e}", file=sys.stderr)
+            sys.exit(1)
+
     try:
-        result = parser.parse(data, offset=args.offset, inspect=args.inspect)
+        result = parser.parse(data, offset=args.offset, inspect=need_inspect)
     except InsufficientDataError as e:
         print(format_error(e, data), file=sys.stderr)
         sys.exit(1)
@@ -190,16 +273,59 @@ def main():
         print(format_error(e, data), file=sys.stderr)
         sys.exit(1)
 
+    result2 = None
+    if data2 is not None:
+        try:
+            result2 = parser.parse(data2, offset=args.offset, inspect=True)
+        except InsufficientDataError as e:
+            print(format_error(e, data2), file=sys.stderr)
+            sys.exit(1)
+        except ValidationError as e:
+            print(format_error(e, data2), file=sys.stderr)
+            sys.exit(1)
+        except ParseError as e:
+            print(format_error(e, data2), file=sys.stderr)
+            sys.exit(1)
+
+    field_info = result.field_info
+    if args.filter:
+        field_info = filter_field_info(field_info, args.filter)
+
     if args.inspect:
-        print(format_inspect_table(result))
+        print(format_inspect_table(field_info, result.consumed))
         print()
 
-    if args.raw:
-        print(result.data)
-    else:
-        indent = None if args.compact else args.indent
-        output = result.to_dict()
-        print(json.dumps(output, indent=indent, default=_json_default, ensure_ascii=False))
+    if args.export_json:
+        export_field_info_json(field_info, args.export_json)
+        print(f"\033[92m[export]\033[0m JSON written to {args.export_json} ({len(field_info)} records)")
+    if args.export_csv:
+        export_field_info_csv(field_info, args.export_csv)
+        print(f"\033[92m[export]\033[0m CSV  written to {args.export_csv} ({len(field_info)} records)")
+
+    if args.compare and result2 is not None:
+        diffs = compare_results(result, result2)
+        print()
+        print("=" * 60)
+        print("  COMPARE RESULTS")
+        print(f"  Old: {args.binary}")
+        print(f"  New: {args.compare}")
+        print("=" * 60)
+        if not diffs:
+            print("(no differences detected)")
+        else:
+            print(format_compare_table(diffs))
+            print()
+            print("Full diff details (JSON):")
+            print(json.dumps([d.to_dict() for d in diffs], indent=2, default=_json_default, ensure_ascii=False))
+        print()
+
+    if not args.compare and not args.export_json and not args.export_csv:
+        if args.raw:
+            print(result.data)
+        else:
+            indent = None if args.compact else args.indent
+            output = result.to_dict()
+            print(json.dumps(output, indent=indent, default=_json_default, ensure_ascii=False))
 
 
 if __name__ == "__main__":

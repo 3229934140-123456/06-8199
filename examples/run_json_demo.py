@@ -31,20 +31,30 @@ SCHEMA_PATH = os.path.join(
 def build_test_binary():
     buf = bytearray()
 
-    buf += b"MARC"
-    buf += struct.pack("<H", 1)
+    # magic: 4 bytes
+    magic = b"MARC"
+    buf += magic
 
-    flags = 0b0000_0000_0000_0011  # compressed + encrypted
-    buf += struct.pack("<H", flags)
+    # version: uint16
+    version = 1
+    buf += struct.pack("<H", version)
 
+    # flags: uint16 bitflags (compressed=bit0, encrypted=bit1)
+    flags_value = 0b0000_0000_0000_0011  # compressed + encrypted (value 3)
+    buf += struct.pack("<H", flags_value)
+
+    # vertex_count: uint32
     vertex_count = 2
     buf += struct.pack("<I", vertex_count)
 
-    name_table = b"file1.txt\x00file2.dat\x00"
-    name_table_size = len(name_table) + 1  # expression uses size - 1
+    # name_table: string length expression = name_table_size - 1
+    # so set name_table_size = actual_string_length + 1
+    name_table_string = "file1.txt\x00file2.dat\x00"  # 20 chars
+    name_table_size = len(name_table_string) + 1  # 21
     buf += struct.pack("<I", name_table_size)
 
-    # vertices: count = vertex_count + 1 = 3 (expression demo)
+    # vertices: array count = vertex_count + 1 = 3 (via expression)
+    # each point = int32 x + int32 y + int32 z
     vertices = [
         (0, 0, 0),
         (1, 0, 0),
@@ -53,23 +63,42 @@ def build_test_binary():
     for x, y, z in vertices:
         buf += struct.pack("<iii", x, y, z)
 
-    # name table (will consume name_table_size - 1 bytes via expression)
-    buf += name_table + b"\x00"
+    # name_table bytes (exactly name_table_size - 1 = 20 bytes, matches expression)
+    buf += name_table_string.encode("utf-8")
 
-    # file entries
+    # file_entries: count=2, each = uint32 index + uint32 size + uint8(enum) type
+    # NO padding per schema definition (each entry is 9 bytes)
     entries = [
-        (0, 1024, 0),
-        (1, 2048, 1),
+        # (index, size, type_value)
+        (100, 262144, 0),   # 0 = regular
+        (200, 524288, 1),   # 1 = directory
     ]
     for idx, size, ftype in entries:
         buf += struct.pack("<IIB", idx, size, ftype)
-        while (len(buf) - 0) % 4 != 0:
-            buf += b"\x00"
 
-    # checksum: conditional on (flags.value & 2) being true
-    buf += struct.pack("<I", 0xCAFEBABE)
+    # checksum: conditional present because flags.value & 2 != 0
+    checksum_value = 0xDEADBEEF
+    buf += struct.pack("<I", checksum_value)
 
-    return bytes(buf)
+    return bytes(buf), {
+        "magic_hex": magic.hex(),
+        "version": version,
+        "flags_value": flags_value,
+        "vertex_count": vertex_count,
+        "name_table_size": name_table_size,
+        "vertices": vertices,
+        "name_table": name_table_string,
+        "entries": entries,
+        "checksum": checksum_value,
+    }
+
+
+def _assert_equal(path, expected, actual):
+    if expected != actual:
+        raise AssertionError(
+            f"Data mismatch at {path}: expected {expected!r}, got {actual!r}"
+        )
+    print(f"    [OK] {path} = {expected!r}")
 
 
 def main():
@@ -77,7 +106,7 @@ def main():
     print("  Binary Parser JSON Schema Demo (with $ref + expressions + inspect)")
     print("=" * 72)
 
-    binary_data = build_test_binary()
+    binary_data, expected = build_test_binary()
     print(f"\nGenerated test binary: {len(binary_data)} bytes")
     print(f"Schema file: {SCHEMA_PATH}")
 
@@ -99,10 +128,40 @@ def main():
         print(f"OK - consumed {result.consumed} bytes")
 
         print("\n" + "-" * 72)
+        print("  Validating parsed values match constructed data...")
+        print("-" * 72)
+        _assert_equal("magic (bytes)", b"MARC", result["magic"])
+        _assert_equal("magic (hex in to_dict)", expected["magic_hex"], result.to_dict()["magic"])
+        _assert_equal("version", expected["version"], result["version"])
+        _assert_equal("flags.value", expected["flags_value"], result["flags"]["value"])
+        _assert_equal("flags.flags.compressed", True, result["flags"]["flags"]["compressed"])
+        _assert_equal("flags.flags.encrypted",  True, result["flags"]["flags"]["encrypted"])
+        _assert_equal("vertex_count", expected["vertex_count"], result["vertex_count"])
+        _assert_equal("name_table_size", expected["name_table_size"], result["name_table_size"])
+        _assert_equal("len(vertices) (= vertex_count+1 via expr)",
+                      len(expected["vertices"]), len(result["vertices"]))
+        for i, (exp, got) in enumerate(zip(expected["vertices"], result["vertices"])):
+            _assert_equal(f"vertices[{i}].x", exp[0], got["x"])
+            _assert_equal(f"vertices[{i}].y", exp[1], got["y"])
+            _assert_equal(f"vertices[{i}].z", exp[2], got["z"])
+        _assert_equal("name_table", expected["name_table"], result["name_table"])
+        _assert_equal("len(file_entries)", len(expected["entries"]), len(result["file_entries"]))
+        for i, ((exp_idx, exp_size, exp_type), got_e) in enumerate(
+                zip(expected["entries"], result["file_entries"])):
+            _assert_equal(f"file_entries[{i}].index", exp_idx, got_e["index"])
+            _assert_equal(f"file_entries[{i}].size",  exp_size,  got_e["size"])
+            _assert_equal(f"file_entries[{i}].entry_type.value", exp_type, got_e["entry_type"]["value"])
+            expected_name = {0: "regular", 1: "directory", 2: "symlink"}.get(exp_type)
+            _assert_equal(f"file_entries[{i}].entry_type.name",  expected_name, got_e["entry_type"]["name"])
+        _assert_equal("checksum (= 0x{:X})".format(expected["checksum"]),
+                      expected["checksum"], result["checksum"])
+        print("    [OK] All values match constructed data.")
+
+        print("\n" + "-" * 72)
         print("  Inspect Table (each field's offset, hex, and interpreted value)")
         print("-" * 72)
         from binparse import format_inspect_table
-        print(format_inspect_table(result))
+        print(format_inspect_table(result.field_info, result.consumed))
 
         print("\n" + "-" * 72)
         print("  Parsed JSON Output")
