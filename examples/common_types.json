@@ -1,0 +1,29 @@
+{
+  "file_type_enum": {
+    "type": "enum",
+    "base_type": "uint8",
+    "mapping": {
+      "0": "regular",
+      "1": "directory",
+      "2": "symlink"
+    }
+  },
+  "point_struct": {
+    "type": "struct",
+    "fields": [
+      { "name": "x", "type": "int32" },
+      { "name": "y", "type": "int32" },
+      { "name": "z", "type": "int32" }
+    ]
+  },
+  "entry_flags": {
+    "type": "bitflags",
+    "base_type": "uint16",
+    "bits": {
+      "0": "compressed",
+      "1": "encrypted",
+      "2": "read_only",
+      "3": "has_extended_attrs"
+    }
+  }
+}

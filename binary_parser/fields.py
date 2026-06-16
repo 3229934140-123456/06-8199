@@ -1,6 +1,13 @@
 import struct
 from enum import Enum
 from .errors import ParseError, InsufficientDataError, ValidationError
+from .expression import eval_expression, is_expression_string
+
+
+def _resolve_ref_or_expr(ref, context):
+    if isinstance(ref, str) and is_expression_string(ref):
+        return eval_expression(ref, context)
+    return _resolve_ref(ref, context)
 
 
 class Endian(Enum):
@@ -145,7 +152,7 @@ class Bytes(Field):
         if callable(self.length):
             return self.length(context)
         if isinstance(self.length, str):
-            return _resolve_ref(self.length, context)
+            return _resolve_ref_or_expr(self.length, context)
         return self.length
 
     def parse(self, data, offset, context, endian=Endian.NATIVE):
@@ -210,7 +217,7 @@ class String(Field):
         if callable(self.length):
             return self.length(context)
         if isinstance(self.length, str):
-            return _resolve_ref(self.length, context)
+            return _resolve_ref_or_expr(self.length, context)
         raise ValueError(f"String '{self.name}' has no determinable size")
 
     def parse(self, data, offset, context, endian=Endian.NATIVE):
@@ -321,7 +328,7 @@ class Padding(Field):
         if callable(self.length):
             return self.length(context)
         if isinstance(self.length, str):
-            return _resolve_ref(self.length, context)
+            return _resolve_ref_or_expr(self.length, context)
         return self.length
 
     def parse(self, data, offset, context, endian=Endian.NATIVE):
@@ -364,7 +371,7 @@ class Array(Field):
         if callable(self.count):
             return self.count(context)
         if isinstance(self.count, str):
-            return _resolve_ref(self.count, context)
+            return int(_resolve_ref_or_expr(self.count, context))
         if isinstance(self.count, int):
             return self.count
         raise ValueError(f"Array '{self.name}' has no count")
@@ -465,7 +472,7 @@ class Conditional(Field):
         if callable(self.condition):
             return self.condition(context)
         if isinstance(self.condition, str):
-            return bool(_resolve_ref(self.condition, context))
+            return bool(_resolve_ref_or_expr(self.condition, context))
         return bool(self.condition)
 
     def parse(self, data, offset, context, endian=Endian.NATIVE):

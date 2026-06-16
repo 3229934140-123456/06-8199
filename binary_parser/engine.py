@@ -5,11 +5,36 @@ from .errors import ParseError, InsufficientDataError
 
 
 @dataclass
+class FieldInfo:
+    name: str
+    path: List[str]
+    start_offset: int
+    end_offset: int
+    size: int
+    raw: bytes
+    value: Any = None
+    hidden: bool = False
+
+    def to_dict(self):
+        d = {
+            "name": self.name,
+            "path": ".".join(self.path),
+            "start_offset": self.start_offset,
+            "end_offset": self.end_offset,
+            "size": self.size,
+            "hex": self.raw.hex(),
+            "value": _to_jsonable(self.value),
+        }
+        return d
+
+
+@dataclass
 class ParseResult:
     data: Dict[str, Any]
     consumed: int
     remaining: bytes
     fields_order: List[str] = field(default_factory=list)
+    field_info: List[FieldInfo] = field(default_factory=list)
 
     def __getitem__(self, key):
         return self.data[key]
@@ -21,18 +46,21 @@ class ParseResult:
         return self.data.get(key, default)
 
     def to_dict(self):
-        return self._to_jsonable(self.data)
+        return _to_jsonable(self.data)
 
-    def _to_jsonable(self, obj):
-        if isinstance(obj, dict):
-            return {k: self._to_jsonable(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [self._to_jsonable(v) for v in obj]
-        if isinstance(obj, bytes):
-            return obj.hex()
-        if isinstance(obj, float):
-            return obj
+
+def _to_jsonable(obj):
+    if isinstance(obj, dict):
+        return {k: _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_jsonable(v) for v in obj]
+    if isinstance(obj, bytes):
+        return obj.hex()
+    if isinstance(obj, bytearray):
+        return obj.hex()
+    if isinstance(obj, float):
         return obj
+    return obj
 
 
 class BinaryParser:
@@ -41,15 +69,17 @@ class BinaryParser:
         self.endian = endian
         self.name = name
 
-    def parse(self, data, offset=0, context=None):
+    def parse(self, data, offset=0, context=None, inspect=False):
         if isinstance(data, (bytes, bytearray)):
             byte_data = bytes(data)
         else:
             raise TypeError("data must be bytes or bytearray")
 
         ctx = context.copy() if context else {}
+        field_info = [] if inspect else None
         result_data, new_offset = _parse_fields(
-            self.fields, byte_data, offset, ctx, self.endian
+            self.fields, byte_data, offset, ctx, self.endian,
+            path=[], field_info=field_info,
         )
 
         return ParseResult(
@@ -57,12 +87,13 @@ class BinaryParser:
             consumed=new_offset - offset,
             remaining=byte_data[new_offset:],
             fields_order=list(result_data.keys()),
+            field_info=field_info or [],
         )
 
-    def parse_file(self, filepath, offset=0, context=None):
+    def parse_file(self, filepath, offset=0, context=None, inspect=False):
         with open(filepath, "rb") as f:
             data = f.read()
-        return self.parse(data, offset=offset, context=context)
+        return self.parse(data, offset=offset, context=context, inspect=inspect)
 
     def size(self, context=None):
         total = 0
@@ -80,7 +111,9 @@ class BinaryParser:
         return total
 
 
-def _parse_fields(fields, data, offset, context, endian):
+def _parse_fields(fields, data, offset, context, endian, path=None, field_info=None):
+    if path is None:
+        path = []
     result = {}
     current_offset = offset
     data_len = len(data)
@@ -94,11 +127,11 @@ def _parse_fields(fields, data, offset, context, endian):
                 field_offset = data_len + field.offset
             else:
                 field_offset = offset + field.offset
-            if field_offset > data_len:
+            if field_offset < 0 or field_offset > data_len:
                 raise InsufficientDataError(
-                    required=0,
-                    available=data_len - field_offset,
-                    offset=field_offset,
+                    required=1,
+                    available=-1,
+                    offset=max(0, min(field_offset, max(0, data_len - 1))),
                     field_name=field.name,
                     total_length=data_len,
                 )
@@ -106,16 +139,17 @@ def _parse_fields(fields, data, offset, context, endian):
 
         if field.align is not None:
             aligned = _align(current_offset, field.align)
-            if aligned > data_len:
+            if aligned < 0 or aligned > data_len:
                 raise InsufficientDataError(
-                    required=aligned - current_offset,
-                    available=data_len - current_offset,
-                    offset=current_offset,
+                    required=1,
+                    available=-1,
+                    offset=max(0, min(aligned, max(0, data_len - 1))),
                     field_name=field.name,
                     total_length=data_len,
                 )
             current_offset = aligned
 
+        start_offset = current_offset
         try:
             fields_dict, current_offset = field.parse_fields(
                 data, current_offset, context, endian
@@ -136,9 +170,34 @@ def _parse_fields(fields, data, offset, context, endian):
                 e = e.with_context(offset=current_offset)
             raise
 
+        end_offset = current_offset
+
         for k, v in fields_dict.items():
             result[k] = v
             context[k] = v
+
+            if field_info is not None:
+                raw_start = start_offset
+                raw_end = end_offset
+                raw_start = max(0, min(raw_start, data_len))
+                raw_end = max(raw_start, min(raw_end, data_len))
+                raw = data[raw_start:raw_end]
+
+                field_path = list(path)
+                if k != field.name or field.name is None:
+                    field_path.append(k)
+                else:
+                    field_path.append(field.name)
+
+                field_info.append(FieldInfo(
+                    name=k,
+                    path=field_path,
+                    start_offset=start_offset,
+                    end_offset=end_offset,
+                    size=end_offset - start_offset,
+                    raw=raw,
+                    value=v,
+                ))
 
     return result, current_offset
 

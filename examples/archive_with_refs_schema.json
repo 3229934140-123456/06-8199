@@ -1,0 +1,55 @@
+{
+  "name": "ArchiveWithRefs",
+  "endian": "little",
+  "fields": [
+    {
+      "name": "magic",
+      "type": "bytes",
+      "length": 4,
+      "validator": "hex:4d415243"
+    },
+    {
+      "name": "version",
+      "type": "uint16"
+    },
+    { "name": "flags", "$ref": "common_types.json#/entry_flags" },
+    {
+      "name": "vertex_count",
+      "type": "uint32"
+    },
+    {
+      "name": "name_table_size",
+      "type": "uint32"
+    },
+    {
+      "name": "vertices",
+      "type": "array",
+      "count": "vertex_count + 1",
+      "element": { "$ref": "common_types.json#/point_struct" }
+    },
+    {
+      "name": "name_table",
+      "type": "string",
+      "length": { "expr": "name_table_size - 1" }
+    },
+    {
+      "name": "file_entries",
+      "type": "array",
+      "count": 2,
+      "element": {
+        "type": "struct",
+        "fields": [
+          { "name": "index", "type": "uint32" },
+          { "name": "size", "type": "uint32" },
+          { "name": "entry_type", "$ref": "common_types.json#/file_type_enum" }
+        ]
+      }
+    },
+    {
+      "name": "checksum",
+      "type": "conditional",
+      "condition": "flags.value & 2",
+      "field": { "name": "checksum", "type": "uint32" }
+    }
+  ]
+}

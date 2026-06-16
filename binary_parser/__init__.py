@@ -1,4 +1,4 @@
-from .engine import BinaryParser, ParseResult
+from .engine import BinaryParser, ParseResult, FieldInfo
 from .fields import (
     Field, UInt8, UInt16, UInt32, UInt64,
     Int8, Int16, Int32, Int64,
@@ -10,9 +10,10 @@ from .fields import (
 )
 from .errors import ParseError, InsufficientDataError, ValidationError
 from .schema import build_parser_from_schema, build_parser_from_file, load_schema
+from .expression import eval_expression
 
 __all__ = [
-    "BinaryParser", "ParseResult",
+    "BinaryParser", "ParseResult", "FieldInfo",
     "Field", "UInt8", "UInt16", "UInt32", "UInt64",
     "Int8", "Int16", "Int32", "Int64",
     "Float32", "Float64",
@@ -22,4 +23,5 @@ __all__ = [
     "Endian", "ByteOrder",
     "ParseError", "InsufficientDataError", "ValidationError",
     "build_parser_from_schema", "build_parser_from_file", "load_schema",
+    "eval_expression",
 ]

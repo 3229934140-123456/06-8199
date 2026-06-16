@@ -12,7 +12,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from binary_parser import (
-    BinaryParser,
+    BinaryParser, FieldInfo,
     UInt8, UInt16, UInt32, UInt64,
     Int8, Int16, Int32, Int64,
     Float32, Float64,
@@ -21,6 +21,7 @@ from binary_parser import (
     BitFlags, Enum,
     Endian, ParseError, InsufficientDataError, ValidationError,
     build_parser_from_schema, build_parser_from_file,
+    eval_expression,
 )
 
 
@@ -725,6 +726,243 @@ class TestToDict(unittest.TestCase):
         d = result.to_dict()
         self.assertEqual(d["magic"], "41424344")
         self.assertEqual(d["val"], 0x1234)
+
+
+class TestExpression(unittest.TestCase):
+
+    def test_simple_arithmetic(self):
+        ctx = {"a": 10, "b": 3}
+        self.assertEqual(eval_expression("a + b", ctx), 13)
+        self.assertEqual(eval_expression("a - b", ctx), 7)
+        self.assertEqual(eval_expression("a * b", ctx), 30)
+        self.assertEqual(eval_expression("a // b", ctx), 3)
+        self.assertEqual(eval_expression("a % b", ctx), 1)
+
+    def test_bitwise_ops(self):
+        ctx = {"flags": 5}
+        self.assertEqual(eval_expression("flags & 2", ctx), 0)
+        self.assertEqual(eval_expression("flags & 4", ctx), 4)
+        self.assertEqual(eval_expression("flags | 8", ctx), 13)
+        self.assertEqual(eval_expression("flags ^ 5", ctx), 0)
+
+    def test_comparison_and_logic(self):
+        ctx = {"a": 10, "b": 5}
+        self.assertTrue(eval_expression("a > b", ctx))
+        self.assertFalse(eval_expression("a < b", ctx))
+        self.assertTrue(eval_expression("a == 10 and b == 5", ctx))
+        self.assertTrue(eval_expression("a != b", ctx))
+
+    def test_nested_field_access(self):
+        ctx = {"header": {"count": 3}, "flags": {"value": 5}}
+        self.assertEqual(eval_expression("header.count + 1", ctx), 4)
+        self.assertEqual(eval_expression("flags.value & 4", ctx), 4)
+
+    def test_expression_in_array_count(self):
+        parser = BinaryParser([
+            UInt8("base"),
+            Array("items", element=UInt8(), count="base + 2"),
+        ])
+        data = b"\x03\x01\x02\x03\x04\x05"
+        result = parser.parse(data)
+        self.assertEqual(result["base"], 3)
+        self.assertEqual(len(result["items"]), 5)
+
+    def test_expression_in_condition(self):
+        parser = BinaryParser([
+            UInt16("flags"),
+            Conditional(
+                "extra",
+                condition="flags & 2",
+                field=UInt32("extra"),
+            ),
+        ], endian=Endian.LITTLE)
+        data = b"\x02\x00" + struct.pack("<I", 0xDEAD)
+        result = parser.parse(data)
+        self.assertEqual(result["flags"], 2)
+        self.assertEqual(result["extra"], 0xDEAD)
+
+        data_no = b"\x01\x00"
+        result2 = parser.parse(data_no)
+        self.assertEqual(result2["flags"], 1)
+        self.assertIsNone(result2["extra"])
+
+    def test_expression_in_string_length(self):
+        parser = BinaryParser([
+            UInt8("size"),
+            String("data", length="size - 1"),
+        ])
+        data = b"\x06Hello!"
+        result = parser.parse(data)
+        self.assertEqual(result["size"], 6)
+        self.assertEqual(result["data"], "Hello")
+
+
+class TestInspectMode(unittest.TestCase):
+
+    def test_field_info_basic(self):
+        parser = BinaryParser([
+            Bytes("magic", length=4),
+            UInt16("version"),
+        ], endian=Endian.LITTLE)
+        result = parser.parse(b"ABCD\x01\x00", inspect=True)
+
+        self.assertEqual(len(result.field_info), 2)
+        self.assertEqual(result.field_info[0].name, "magic")
+        self.assertEqual(result.field_info[0].start_offset, 0)
+        self.assertEqual(result.field_info[0].end_offset, 4)
+        self.assertEqual(result.field_info[0].size, 4)
+        self.assertEqual(result.field_info[0].raw, b"ABCD")
+
+        self.assertEqual(result.field_info[1].name, "version")
+        self.assertEqual(result.field_info[1].start_offset, 4)
+        self.assertEqual(result.field_info[1].end_offset, 6)
+        self.assertEqual(result.field_info[1].value, 1)
+
+    def test_inspect_without_flag(self):
+        parser = BinaryParser([UInt8("a")])
+        result = parser.parse(b"\x42")
+        self.assertEqual(len(result.field_info), 0)
+
+    def test_field_info_to_dict(self):
+        parser = BinaryParser([UInt8("x")])
+        result = parser.parse(b"\x05", inspect=True)
+        info = result.field_info[0].to_dict()
+        self.assertEqual(info["name"], "x")
+        self.assertEqual(info["start_offset"], 0)
+        self.assertEqual(info["hex"], "05")
+        self.assertEqual(info["value"], 5)
+
+
+class TestSchemaRefs(unittest.TestCase):
+
+    def test_local_ref(self):
+        from binary_parser.schema_loader import resolve_refs
+        schema = {
+            "definitions": {
+                "point": {"type": "struct", "fields": [{"name": "x", "type": "int32"}]},
+            },
+            "endian": "little",
+            "fields": [
+                {"name": "p", "$ref": "#/definitions/point"},
+            ],
+        }
+        resolved = resolve_refs(schema, ".")
+        parser = build_parser_from_schema(resolved)
+        data = struct.pack("<i", 42)
+        result = parser.parse(data)
+        self.assertEqual(result["p"]["x"], 42)
+
+
+class TestOffsetSafety(unittest.TestCase):
+
+    def test_offset_way_beyond_end_no_crash(self):
+        parser = BinaryParser([
+            UInt8("a"),
+            UInt8("b", offset=10000),
+        ])
+        data = b"\x01\x02"
+        try:
+            parser.parse(data)
+            self.fail("should have raised")
+        except InsufficientDataError as e:
+            self.assertIn("beyond end of input", str(e))
+            self.assertEqual(e.total_length, 2)
+            self.assertGreaterEqual(e.offset, 0)
+
+    def test_negative_offset_result_no_crash(self):
+        parser = BinaryParser([
+            UInt8("a"),
+            UInt8("b", offset=-10),
+        ])
+        data = b"\x01\x02"
+        try:
+            parser.parse(data)
+            self.fail("should have raised")
+        except InsufficientDataError as e:
+            self.assertIn("beyond end of input", str(e))
+            self.assertGreaterEqual(e.offset, 0)
+
+    def test_normal_offset_within_range(self):
+        parser = BinaryParser([
+            UInt8("a"),
+            UInt8("b", offset=10),
+        ])
+        data = b"\x01" + b"\x00" * 9 + b"\x2a"
+        result = parser.parse(data)
+        self.assertEqual(result["a"], 1)
+        self.assertEqual(result["b"], 42)
+
+
+class TestSchemaExpressionFormats(unittest.TestCase):
+
+    def test_count_with_expr_string(self):
+        schema = {
+            "endian": "little",
+            "fields": [
+                {"name": "n", "type": "uint8"},
+                {
+                    "name": "items",
+                    "type": "array",
+                    "count": "n + 1",
+                    "element": {"type": "uint8"},
+                },
+            ],
+        }
+        parser = build_parser_from_schema(schema)
+        result = parser.parse(b"\x03\x01\x02\x03\x04")
+        self.assertEqual(result["n"], 3)
+        self.assertEqual(result["items"], [1, 2, 3, 4])
+
+    def test_count_with_expr_object(self):
+        schema = {
+            "endian": "little",
+            "fields": [
+                {"name": "n", "type": "uint8"},
+                {
+                    "name": "items",
+                    "type": "array",
+                    "count": {"expr": "n * 2"},
+                    "element": {"type": "uint8"},
+                },
+            ],
+        }
+        parser = build_parser_from_schema(schema)
+        data = b"\x02\x01\x02\x03\x04"
+        result = parser.parse(data)
+        self.assertEqual(result["items"], [1, 2, 3, 4])
+
+    def test_length_with_expr_object(self):
+        schema = {
+            "endian": "little",
+            "fields": [
+                {"name": "total", "type": "uint8"},
+                {
+                    "name": "name",
+                    "type": "string",
+                    "length": {"expr": "total - 1"},
+                },
+            ],
+        }
+        parser = build_parser_from_schema(schema)
+        result = parser.parse(b"\x06Hello!")
+        self.assertEqual(result["name"], "Hello")
+
+    def test_condition_as_expression_string(self):
+        schema = {
+            "endian": "little",
+            "fields": [
+                {"name": "flags", "type": "uint8"},
+                {
+                    "name": "extra",
+                    "type": "conditional",
+                    "condition": "flags & 1",
+                    "field": {"name": "extra", "type": "uint16"},
+                },
+            ],
+        }
+        parser = build_parser_from_schema(schema)
+        result = parser.parse(b"\x01\x34\x12")
+        self.assertEqual(result["extra"], 0x1234)
 
 
 if __name__ == "__main__":

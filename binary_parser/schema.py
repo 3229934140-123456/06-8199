@@ -11,6 +11,8 @@ from .fields import (
 )
 from .engine import BinaryParser
 from .errors import ParseError
+from .expression import eval_expression, is_expression_string
+from .schema_loader import load_schema, resolve_refs
 
 
 _TYPE_MAP = {
@@ -59,10 +61,9 @@ def _build_condition(condition_spec):
         return None
 
     if isinstance(condition_spec, str):
-        ref = condition_spec
-        def cond(ctx, _ref=ref):
-            from .fields import _resolve_ref
-            return bool(_resolve_ref(_ref, ctx))
+        expr = condition_spec
+        def cond(ctx, _expr=expr):
+            return bool(eval_expression(_expr, ctx))
         return cond
 
     if isinstance(condition_spec, dict):
@@ -144,7 +145,34 @@ def _build_length_expr(length_spec):
             if ref.startswith("$"):
                 return ref[1:]
             return ref
+        if length_spec.get("expr"):
+            expr = length_spec["expr"]
+            def _expr_length(ctx, _expr=expr):
+                return int(eval_expression(_expr, ctx))
+            return _expr_length
     raise ValueError(f"unsupported length spec: {length_spec!r}")
+
+
+def _resolve_count_spec(count_spec):
+    if count_spec is None:
+        return None
+    if isinstance(count_spec, int):
+        return count_spec
+    if isinstance(count_spec, str):
+        stripped = count_spec.lstrip("$")
+        return stripped
+    if isinstance(count_spec, dict):
+        if count_spec.get("expr"):
+            expr = count_spec["expr"]
+            def _expr_count(ctx, _expr=expr):
+                return int(eval_expression(_expr, ctx))
+            return _expr_count
+        if count_spec.get("field"):
+            ref = count_spec["field"]
+            if ref.startswith("$"):
+                return ref[1:]
+            return ref
+    raise ValueError(f"unsupported count spec: {count_spec!r}")
 
 
 def _build_field(spec):
@@ -214,12 +242,9 @@ def _build_field(spec):
             raise ValueError(f"array '{name}' requires 'element'")
         element = _build_field(element_spec)
         kw["element"] = element
-        count = spec.get("count")
+        count = _resolve_count_spec(spec.get("count"))
         if count is not None:
-            if isinstance(count, str):
-                kw["count"] = count.lstrip("$")
-            elif isinstance(count, int):
-                kw["count"] = count
+            kw["count"] = count
         return Array(name, **kw)
 
     if cls is Struct:
@@ -270,24 +295,6 @@ def _build_field(spec):
         return Enum(name, **kw)
 
     return cls(name, **common_kw)
-
-
-def load_schema(path):
-    with open(path, "r", encoding="utf-8") as f:
-        raw = f.read()
-
-    ext = os.path.splitext(path)[1].lower()
-
-    if ext in (".yaml", ".yml"):
-        try:
-            import yaml
-        except ImportError:
-            raise ImportError("PyYAML is required for YAML schema files. Install with: pip install pyyaml")
-        schema = yaml.safe_load(raw)
-    else:
-        schema = json.loads(raw)
-
-    return schema
 
 
 def build_parser_from_schema(schema):
