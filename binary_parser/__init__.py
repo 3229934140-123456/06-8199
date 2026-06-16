@@ -5,9 +5,11 @@ from .fields import (
     Float32, Float64,
     String, Bytes, Padding,
     Array, Struct, Conditional,
+    BitFlags, Enum,
     Endian, ByteOrder,
 )
 from .errors import ParseError, InsufficientDataError, ValidationError
+from .schema import build_parser_from_schema, build_parser_from_file, load_schema
 
 __all__ = [
     "BinaryParser", "ParseResult",
@@ -16,6 +18,8 @@ __all__ = [
     "Float32", "Float64",
     "String", "Bytes", "Padding",
     "Array", "Struct", "Conditional",
+    "BitFlags", "Enum",
     "Endian", "ByteOrder",
     "ParseError", "InsufficientDataError", "ValidationError",
+    "build_parser_from_schema", "build_parser_from_file", "load_schema",
 ]

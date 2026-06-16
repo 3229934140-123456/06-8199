@@ -41,19 +41,21 @@ class Field:
     def _resolve_endian(self, endian):
         return self.endian.value if self.endian else endian.value
 
-    def _validate(self, value, context):
+    def _validate(self, value, context, offset=None):
         if self.validator is not None:
             if callable(self.validator):
                 if not self.validator(value):
                     raise ValidationError(
                         expected="validator pass",
                         actual=value,
+                        offset=offset,
                         field_name=self.name,
                     )
             elif value != self.validator:
                 raise ValidationError(
                     expected=self.validator,
                     actual=value,
+                    offset=offset,
                     field_name=self.name,
                 )
         return value
@@ -76,7 +78,7 @@ class _NumericField(Field):
                 field_name=self.name,
             )
         value = struct.unpack_from(fmt, data, offset)[0]
-        self._validate(value, context)
+        self._validate(value, context, offset=offset)
         return value, offset + needed
 
 
@@ -163,7 +165,7 @@ class Bytes(Field):
                 field_name=self.name,
             )
         value = data[offset:offset + length]
-        self._validate(value, context)
+        self._validate(value, context, offset=offset)
         return value, offset + length
 
     def parse_fields(self, data, offset, context, endian=Endian.NATIVE):
@@ -180,7 +182,7 @@ class Bytes(Field):
                     field_name=self.name,
                 )
             value = data[offset:offset + length]
-            self._validate(value, context)
+            self._validate(value, context, offset=offset)
 
             result = {self.length.name: len_val}
             if self.name is not None:
@@ -255,7 +257,7 @@ class String(Field):
                 field_name=self.name,
             ) from e
 
-        self._validate(value, context)
+        self._validate(value, context, offset=offset)
         return value, new_offset
 
     def parse_fields(self, data, offset, context, endian=Endian.NATIVE):
@@ -297,7 +299,7 @@ class String(Field):
                     field_name=self.name,
                 ) from e
 
-            self._validate(value, context)
+            self._validate(value, context, offset=offset)
 
             result = {self.length.name: len_val}
             if self.name is not None:
@@ -397,6 +399,60 @@ class Struct(Field):
         result, offset = _parse_fields(self.fields, data, offset, context, endian)
         self._validate(result, context)
         return result, offset
+
+
+class BitFlags(_NumericField):
+    def __init__(self, name=None, *, bits, type_=None, endian=None, **kwargs):
+        if type_ is not None:
+            self._type_hint = type_
+        elif "fmt" in kwargs:
+            self._type_hint = None
+        else:
+            self._type_hint = UInt8
+        if "fmt" not in kwargs:
+            if type_ is UInt16:
+                kwargs["fmt"] = "H"
+                kwargs["size"] = 2
+            elif type_ is UInt32:
+                kwargs["fmt"] = "I"
+                kwargs["size"] = 4
+            elif type_ is UInt64:
+                kwargs["fmt"] = "Q"
+                kwargs["size"] = 8
+            else:
+                kwargs["fmt"] = "B"
+                kwargs["size"] = 1
+        super().__init__(name, endian=endian, **kwargs)
+        self.bits = bits
+
+    def parse(self, data, offset, context, endian=Endian.NATIVE):
+        raw_value, new_offset = super().parse(data, offset, context, endian)
+        flags = {}
+        for bit_pos, flag_name in self.bits.items():
+            flags[flag_name] = bool(raw_value & (1 << bit_pos))
+        return {
+            "value": raw_value,
+            "flags": flags,
+        }, new_offset
+
+
+class Enum(Field):
+    def __init__(self, name=None, *, mapping, type_=None, endian=None, **kwargs):
+        super().__init__(name, endian=endian, **kwargs)
+        self.mapping = mapping
+        if type_ is not None:
+            self._inner = type_(name)
+        else:
+            self._inner = UInt8(name)
+        self._size = self._inner._size
+
+    def parse(self, data, offset, context, endian=Endian.NATIVE):
+        raw_value, new_offset = self._inner.parse(data, offset, context, endian)
+        name = self.mapping.get(raw_value)
+        return {
+            "value": raw_value,
+            "name": name,
+        }, new_offset
 
 
 class Conditional(Field):

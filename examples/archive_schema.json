@@ -1,0 +1,78 @@
+{
+  "name": "MyArchive",
+  "endian": "little",
+  "fields": [
+    {
+      "name": "magic",
+      "type": "bytes",
+      "length": 4,
+      "validator": "hex:4d415243"
+    },
+    {
+      "name": "version",
+      "type": "uint16"
+    },
+    {
+      "name": "flags",
+      "type": "bitflags",
+      "base_type": "uint16",
+      "bits": {
+        "0": "has_extended_header",
+        "1": "has_checksum"
+      }
+    },
+    {
+      "name": "file_count",
+      "type": "uint32"
+    },
+    {
+      "name": "name_table_offset",
+      "type": "uint32"
+    },
+    {
+      "name": "data_offset",
+      "type": "uint32"
+    },
+    {
+      "name": "extended_header",
+      "type": "conditional",
+      "condition": { "op": "bit_set", "field": "flags.value", "bit": 0 },
+      "field": {
+        "type": "struct",
+        "fields": [
+          { "name": "created_at", "type": "uint64" },
+          { "name": "author", "type": "string", "length": { "type": "uint8", "name": "name_len" } }
+        ]
+      }
+    },
+    {
+      "name": "file_entries",
+      "type": "array",
+      "count": "file_count",
+      "element": {
+        "type": "struct",
+        "fields": [
+          { "name": "index", "type": "uint32" },
+          { "name": "size", "type": "uint32" },
+          { "name": "data_offset", "type": "uint32" },
+          {
+            "name": "entry_type",
+            "type": "enum",
+            "base_type": "uint8",
+            "mapping": {
+              "0": "regular",
+              "1": "directory",
+              "2": "symlink"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "checksum",
+      "type": "conditional",
+      "condition": { "op": "bit_set", "field": "flags.value", "bit": 1 },
+      "field": { "name": "checksum", "type": "uint32" }
+    }
+  ]
+}

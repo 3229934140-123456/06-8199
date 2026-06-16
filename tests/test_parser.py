@@ -18,7 +18,9 @@ from binary_parser import (
     Float32, Float64,
     String, Bytes, Padding,
     Array, Struct, Conditional,
+    BitFlags, Enum,
     Endian, ParseError, InsufficientDataError, ValidationError,
+    build_parser_from_schema, build_parser_from_file,
 )
 
 
@@ -435,6 +437,294 @@ class TestContextReferences(unittest.TestCase):
         result = parser.parse(data)
         self.assertEqual(result["header"]["count"], 3)
         self.assertEqual(result["data"], [10, 11, 12])
+
+
+class TestBitFlags(unittest.TestCase):
+
+    def test_basic_bitflags(self):
+        parser = BinaryParser([
+            BitFlags("flags", type_=UInt8, bits={0: "read", 1: "write", 2: "execute"}),
+        ])
+        data = b"\x05"
+        result = parser.parse(data)
+        self.assertEqual(result["flags"]["value"], 5)
+        self.assertTrue(result["flags"]["flags"]["read"])
+        self.assertFalse(result["flags"]["flags"]["write"])
+        self.assertTrue(result["flags"]["flags"]["execute"])
+
+    def test_bitflags_uint16(self):
+        parser = BinaryParser([
+            BitFlags("ctrl", type_=UInt16, bits={0: "enabled", 3: "compressed", 7: "encrypted"}),
+        ], endian=Endian.LITTLE)
+        data = struct.pack("<H", 0x0089)
+        result = parser.parse(data)
+        self.assertEqual(result["ctrl"]["value"], 0x0089)
+        self.assertTrue(result["ctrl"]["flags"]["enabled"])
+        self.assertTrue(result["ctrl"]["flags"]["compressed"])
+        self.assertTrue(result["ctrl"]["flags"]["encrypted"])
+
+    def test_bitflags_all_clear(self):
+        parser = BinaryParser([
+            BitFlags("status", type_=UInt8, bits={0: "a", 1: "b"}),
+        ])
+        result = parser.parse(b"\x00")
+        self.assertEqual(result["status"]["value"], 0)
+        self.assertFalse(result["status"]["flags"]["a"])
+        self.assertFalse(result["status"]["flags"]["b"])
+
+
+class TestEnum(unittest.TestCase):
+
+    def test_basic_enum(self):
+        parser = BinaryParser([
+            Enum("type", type_=UInt8, mapping={0: "none", 1: "file", 2: "dir"}),
+        ])
+        result = parser.parse(b"\x01")
+        self.assertEqual(result["type"]["value"], 1)
+        self.assertEqual(result["type"]["name"], "file")
+
+    def test_enum_unknown_value(self):
+        parser = BinaryParser([
+            Enum("type", type_=UInt8, mapping={0: "none", 1: "file"}),
+        ])
+        result = parser.parse(b"\x99")
+        self.assertEqual(result["type"]["value"], 0x99)
+        self.assertIsNone(result["type"]["name"])
+
+    def test_enum_uint16(self):
+        parser = BinaryParser([
+            Enum("machine", type_=UInt16, mapping={0x03: "EM_386", 0x3E: "EM_X86_64"}),
+        ], endian=Endian.LITTLE)
+        data = struct.pack("<H", 0x3E)
+        result = parser.parse(data)
+        self.assertEqual(result["machine"]["value"], 0x3E)
+        self.assertEqual(result["machine"]["name"], "EM_X86_64")
+
+
+class TestErrorImprovements(unittest.TestCase):
+
+    def test_offset_beyond_file_size(self):
+        parser = BinaryParser([
+            UInt8("a", offset=100),
+        ])
+        data = b"\x01\x02\x03"
+        try:
+            parser.parse(data)
+            self.fail("should have raised")
+        except InsufficientDataError as e:
+            self.assertIn("3 bytes", str(e))
+            self.assertIn("beyond end of input", str(e))
+
+    def test_negative_available_no_more(self):
+        parser = BinaryParser([
+            UInt8("a"),
+            UInt32("b", offset=50),
+        ])
+        data = b"\x01\x02"
+        try:
+            parser.parse(data)
+            self.fail("should have raised")
+        except InsufficientDataError as e:
+            self.assertNotIn("-1 available", str(e))
+
+
+class TestSchemaLoader(unittest.TestCase):
+
+    def test_basic_schema(self):
+        schema = {
+            "name": "TestFormat",
+            "endian": "little",
+            "fields": [
+                {"name": "magic", "type": "bytes", "length": 4, "validator": "hex:41424344"},
+                {"name": "version", "type": "uint16"},
+                {"name": "count", "type": "uint32"},
+            ],
+        }
+        parser = build_parser_from_schema(schema)
+        data = b"ABCD" + struct.pack("<HI", 1, 42)
+        result = parser.parse(data)
+        self.assertEqual(result["magic"], b"ABCD")
+        self.assertEqual(result["version"], 1)
+        self.assertEqual(result["count"], 42)
+
+    def test_schema_with_array(self):
+        schema = {
+            "endian": "little",
+            "fields": [
+                {"name": "count", "type": "uint8"},
+                {
+                    "name": "items",
+                    "type": "array",
+                    "count": "count",
+                    "element": {"type": "uint16"},
+                },
+            ],
+        }
+        parser = build_parser_from_schema(schema)
+        data = b"\x03" + struct.pack("<HHH", 10, 20, 30)
+        result = parser.parse(data)
+        self.assertEqual(result["count"], 3)
+        self.assertEqual(result["items"], [10, 20, 30])
+
+    def test_schema_with_conditional(self):
+        schema = {
+            "endian": "little",
+            "fields": [
+                {"name": "flags", "type": "uint8"},
+                {
+                    "name": "extra",
+                    "type": "conditional",
+                    "condition": {"op": "eq", "field": "flags", "value": 1},
+                    "field": {"name": "extra_val", "type": "uint16"},
+                },
+            ],
+        }
+        parser = build_parser_from_schema(schema)
+
+        data_present = b"\x01" + struct.pack("<H", 0x1234)
+        result = parser.parse(data_present)
+        self.assertEqual(result["flags"], 1)
+        self.assertIsNotNone(result["extra"])
+
+        data_absent = b"\x00"
+        result = parser.parse(data_absent)
+        self.assertEqual(result["flags"], 0)
+        self.assertIsNone(result["extra"])
+
+    def test_schema_with_bitflags(self):
+        schema = {
+            "endian": "little",
+            "fields": [
+                {
+                    "name": "perms",
+                    "type": "bitflags",
+                    "base_type": "uint8",
+                    "bits": {"0": "read", "1": "write", "2": "exec"},
+                },
+            ],
+        }
+        parser = build_parser_from_schema(schema)
+        result = parser.parse(b"\x05")
+        self.assertEqual(result["perms"]["value"], 5)
+        self.assertTrue(result["perms"]["flags"]["read"])
+        self.assertTrue(result["perms"]["flags"]["exec"])
+        self.assertFalse(result["perms"]["flags"]["write"])
+
+    def test_schema_with_enum(self):
+        schema = {
+            "endian": "little",
+            "fields": [
+                {
+                    "name": "file_type",
+                    "type": "enum",
+                    "base_type": "uint8",
+                    "mapping": {"0": "regular", "1": "directory"},
+                },
+            ],
+        }
+        parser = build_parser_from_schema(schema)
+        result = parser.parse(b"\x01")
+        self.assertEqual(result["file_type"]["value"], 1)
+        self.assertEqual(result["file_type"]["name"], "directory")
+
+    def test_schema_with_struct(self):
+        schema = {
+            "endian": "little",
+            "fields": [
+                {
+                    "name": "header",
+                    "type": "struct",
+                    "fields": [
+                        {"name": "width", "type": "uint16"},
+                        {"name": "height", "type": "uint16"},
+                    ],
+                },
+            ],
+        }
+        parser = build_parser_from_schema(schema)
+        data = struct.pack("<HH", 640, 480)
+        result = parser.parse(data)
+        self.assertEqual(result["header"]["width"], 640)
+        self.assertEqual(result["header"]["height"], 480)
+
+    def test_schema_with_string_null_terminated(self):
+        schema = {
+            "endian": "little",
+            "fields": [
+                {"name": "name", "type": "string", "null_terminated": True},
+            ],
+        }
+        parser = build_parser_from_schema(schema)
+        result = parser.parse(b"Hello\x00extra")
+        self.assertEqual(result["name"], "Hello")
+
+    def test_schema_with_string_fixed_length(self):
+        schema = {
+            "endian": "little",
+            "fields": [
+                {"name": "name", "type": "string", "length": 5},
+            ],
+        }
+        parser = build_parser_from_schema(schema)
+        result = parser.parse(b"Hello")
+        self.assertEqual(result["name"], "Hello")
+
+    def test_schema_with_padding(self):
+        schema = {
+            "endian": "little",
+            "fields": [
+                {"name": "a", "type": "uint8"},
+                {"type": "padding", "length": 3},
+                {"name": "b", "type": "uint8"},
+            ],
+        }
+        parser = build_parser_from_schema(schema)
+        result = parser.parse(b"\x01\x00\x00\x00\x02")
+        self.assertEqual(result["a"], 1)
+        self.assertEqual(result["b"], 2)
+
+    def test_schema_with_bit_set_condition(self):
+        schema = {
+            "endian": "little",
+            "fields": [
+                {"name": "flags", "type": "uint16"},
+                {
+                    "name": "checksum",
+                    "type": "conditional",
+                    "condition": {"op": "bit_set", "field": "flags", "bit": 0},
+                    "field": {"name": "checksum", "type": "uint32"},
+                },
+            ],
+        }
+        parser = build_parser_from_schema(schema)
+        data = b"\x01\x00" + struct.pack("<I", 0xDEAD)
+        result = parser.parse(data)
+        self.assertEqual(result["flags"], 1)
+        self.assertEqual(result["checksum"], 0xDEAD)
+
+    def test_schema_file_loading(self):
+        schema_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "examples", "archive_schema.json",
+        )
+        if not os.path.exists(schema_path):
+            self.skipTest("archive_schema.json not found")
+
+        parser = build_parser_from_file(schema_path)
+        self.assertIsNotNone(parser)
+
+
+class TestToDict(unittest.TestCase):
+
+    def test_to_dict_bytes_to_hex(self):
+        parser = BinaryParser([
+            Bytes("magic", length=4),
+            UInt16("val"),
+        ], endian=Endian.LITTLE)
+        result = parser.parse(b"ABCD\x34\x12")
+        d = result.to_dict()
+        self.assertEqual(d["magic"], "41424344")
+        self.assertEqual(d["val"], 0x1234)
 
 
 if __name__ == "__main__":

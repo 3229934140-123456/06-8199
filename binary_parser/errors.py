@@ -29,10 +29,17 @@ class ParseError(Exception):
 
 
 class InsufficientDataError(ParseError):
-    def __init__(self, required, available, offset=None, field_name=None, field_path=None):
+    def __init__(self, required, available, offset=None, field_name=None, field_path=None, total_length=None):
         self.required = required
         self.available = available
-        message = f"insufficient data: need {required} bytes, only {available} available"
+        self.total_length = total_length
+        if available < 0:
+            message = (
+                f"offset 0x{offset:08x} ({offset}) is beyond end of input "
+                f"(input is {total_length} bytes)"
+            )
+        else:
+            message = f"insufficient data: need {required} bytes, only {available} available"
         super().__init__(message, offset=offset, field_name=field_name, field_path=field_path)
 
 
